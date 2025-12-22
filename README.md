@@ -34,7 +34,7 @@ Some APIs (like LinkedIn data providers) will block you if you send too many req
 
 ### Step 1: Create a New Project
 
-1. Go to [railway.app](https://railway.app) and sign in
+1. Go to railway, please use my referal link :) https://railway.com?referralCode=HwTrPp and sign in
 2. Click **"New Project"** → **"Empty Project"**
 
 ### Step 2: Add Redis
@@ -206,11 +206,10 @@ Possible statuses: `queued`, `completed`, `completed_webhook_failed`, `failed`, 
 
 ## Cost
 
-**Railway pricing (as of 2024):**
+**Railway pricing (as of 2025):**
 - Free tier: $5/month credit (usually enough for small projects)
-- Paid: ~$5-10/month for this setup depending on usage
 
-**Redis:** Included in Railway, minimal cost
+**Redis:** Included in Railway
 
 ---
 
