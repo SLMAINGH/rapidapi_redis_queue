@@ -20,7 +20,7 @@ logging.basicConfig(
 logger = logging.getLogger("api_proxy")
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
-SECONDS_BETWEEN_REQUESTS = float(os.getenv("RATE_LIMIT_DELAY", "3.0"))
+SECONDS_BETWEEN_REQUESTS = float(os.getenv("RATE_LIMIT_DELAY", "3.5"))
 REDIS_QUEUE_KEY = "api_request_queue"
 REDIS_JOB_PREFIX = "job:"
 REDIS_EXPIRATION = 3600
