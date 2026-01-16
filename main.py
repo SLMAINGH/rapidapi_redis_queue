@@ -388,6 +388,7 @@ async def process_search_posts_job(job: Dict[str, Any], client: httpx.AsyncClien
     # Track if we should continue to next page
     should_continue = has_more
     posts_sent = 0
+    posts_filtered = 0
     cutoff_reached = False
     
     # Send individual webhooks for each post
@@ -397,6 +398,17 @@ async def process_search_posts_job(job: Dict[str, Any], client: httpx.AsyncClien
             cutoff_date = datetime.now(timezone.utc) - timedelta(days=int(custom_days_ago))
         
         for post in posts:
+            # Check if keyword actually appears in post content
+            post_title = post.get('title', '') or ''
+            post_text = post.get('text', '') or ''
+            post_content = f"{post_title} {post_text}".lower()
+            keyword_lower = keyword.lower()
+            
+            if keyword_lower not in post_content:
+                posts_filtered += 1
+                logger.debug(f"Skipping post {post.get('id', 'unknown')} - keyword '{keyword}' not found in content")
+                continue
+            
             # Check custom date filter
             if cutoff_date:
                 created_at = post.get('created_at')
@@ -434,7 +446,7 @@ async def process_search_posts_job(job: Dict[str, Any], client: httpx.AsyncClien
             # Rate limit between webhook calls
             await asyncio.sleep(WEBHOOK_DELAY_SECONDS)
     
-    logger.info(f"✓ Sent {posts_sent} webhooks for page {page}")
+    logger.info(f"✓ Sent {posts_sent} webhooks for page {page} (filtered out {posts_filtered} without keyword)")
     
     # Queue next page if needed
     if should_continue and not cutoff_reached:
@@ -484,6 +496,7 @@ async def process_search_posts_job(job: Dict[str, Any], client: httpx.AsyncClien
         'page': page,
         'posts_fetched': len(posts),
         'posts_sent': posts_sent,
+        'posts_filtered': posts_filtered,
         'has_more': has_more,
         'continued': should_continue and not cutoff_reached
     }
