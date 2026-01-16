@@ -27,9 +27,9 @@ REDIS_JOB_PREFIX = "job:"
 REDIS_EXPIRATION = 3600
 GLOBAL_HEADERS = json.loads(os.getenv("GLOBAL_HEADERS", "{}"))
 
-# LinkedIn API key from environment
-RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY", "")
-RAPIDAPI_HOST = os.getenv("RAPIDAPI_HOST", "fresh-linkedin-scraper-api.p.rapidapi.com")
+# Extract RapidAPI credentials from GLOBAL_HEADERS
+RAPIDAPI_KEY = GLOBAL_HEADERS.get("x-rapidapi-key", "")
+RAPIDAPI_HOST = GLOBAL_HEADERS.get("x-rapidapi-host", "fresh-linkedin-scraper-api.p.rapidapi.com")
 
 redis_client: Optional[redis.Redis] = None
 MAX_WEBHOOK_SIZE_BYTES = 100 * 1024  # 100 KB
@@ -742,11 +742,11 @@ async def lifespan(app: FastAPI):
         await redis_client.ping()
         logger.info("Redis connected")
         
-        # Validate RAPIDAPI_KEY
+        # Validate RapidAPI credentials from GLOBAL_HEADERS
         if not RAPIDAPI_KEY:
-            logger.warning("RAPIDAPI_KEY not set - LinkedIn API calls will fail")
+            logger.warning("x-rapidapi-key not found in GLOBAL_HEADERS - LinkedIn API calls will fail")
         else:
-            logger.info("RAPIDAPI_KEY configured")
+            logger.info("RapidAPI credentials loaded from GLOBAL_HEADERS")
         
         asyncio.create_task(queue_worker())
     except Exception as e:
