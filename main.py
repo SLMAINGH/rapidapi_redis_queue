@@ -27,13 +27,19 @@ REDIS_JOB_PREFIX = "job:"
 REDIS_EXPIRATION = 3600
 GLOBAL_HEADERS = json.loads(os.getenv("GLOBAL_HEADERS", "{}"))
 
+# LinkedIn API key from environment
+RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY", "")
+RAPIDAPI_HOST = os.getenv("RAPIDAPI_HOST", "fresh-linkedin-scraper-api.p.rapidapi.com")
+
 redis_client: Optional[redis.Redis] = None
 MAX_WEBHOOK_SIZE_BYTES = 100 * 1024  # 100 KB
+WEBHOOK_DELAY_SECONDS = 1.0  # Delay between individual post webhooks
 
 # LinkedIn API endpoints
 PROFILE_API = "https://fresh-linkedin-scraper-api.p.rapidapi.com/api/v1/user/profile"
 REACTIONS_API = "https://fresh-linkedin-scraper-api.p.rapidapi.com/api/v1/user/reactions"
 POSTS_API = "https://fresh-linkedin-scraper-api.p.rapidapi.com/api/v1/user/posts"
+SEARCH_POSTS_API = "https://fresh-linkedin-scraper-api.p.rapidapi.com/api/v1/search/posts"
 
 PROFILE_OPTIONAL_PARAMS = [
     'include_follower_and_connection',
@@ -50,6 +56,16 @@ PROFILE_OPTIONAL_PARAMS = [
 
 
 # ==================== LINKEDIN HELPERS ====================
+
+def get_rapidapi_headers(api_host: Optional[str] = None) -> Dict[str, str]:
+    """Get RapidAPI headers using environment variable."""
+    if not RAPIDAPI_KEY:
+        raise ValueError("RAPIDAPI_KEY environment variable is not set")
+    return {
+        'x-rapidapi-key': RAPIDAPI_KEY,
+        'x-rapidapi-host': api_host or RAPIDAPI_HOST
+    }
+
 
 def is_within_last_n_days(timestamp_str, days=30):
     try:
@@ -97,17 +113,13 @@ async def process_linkedin_scraper_job(job: Dict[str, Any], client: httpx.AsyncC
     """Process LinkedIn scraper job with all the original logic"""
     
     username = job.get('username')
-    api_key = job['api_key']
-    api_host = job.get('api_host', 'fresh-linkedin-scraper-api.p.rapidapi.com')
+    api_host = job.get('api_host', RAPIDAPI_HOST)
     webhook_url = job.get('webhook_url')
     provided_urn = job.get('urn')
     posted_max_days_ago = int(job.get('posted_max_days_ago', 30))
     input_full_name = job.get('full_name')
 
-    headers = {
-        'x-rapidapi-key': api_key,
-        'x-rapidapi-host': api_host
-    }
+    headers = get_rapidapi_headers(api_host)
 
     results = {
         'username': username,
@@ -279,6 +291,204 @@ async def process_linkedin_scraper_job(job: Dict[str, Any], client: httpx.AsyncC
     return results
 
 
+async def process_search_posts_job(job: Dict[str, Any], client: httpx.AsyncClient) -> Dict[str, Any]:
+    """
+    Process LinkedIn search posts job.
+    Fetches one page, sends individual webhooks per post, queues next page if needed.
+    """
+    job_id = job['job_id']
+    search_session_id = job.get('search_session_id', job_id)
+    keyword = job['keyword']
+    webhook_url = job.get('webhook_url')
+    page = job.get('page', 1)
+    
+    # Optional API parameters
+    date_posted = job.get('date_posted')  # past_month, past_week, past_24h
+    sort_by = job.get('sort_by')  # date_posted, relevance
+    content_type = job.get('content_type')  # videos, photos, jobs, live_videos, documents, collaborative_articles
+    custom_days_ago = job.get('custom_days_ago')  # Custom date filter (e.g., 90)
+    
+    # Retry tracking
+    retry_count = job.get('_retry_count', 0)
+    max_retries = 3
+    
+    headers = get_rapidapi_headers()
+    
+    # Build API params
+    params = {
+        'keyword': keyword,
+        'page': page
+    }
+    
+    if custom_days_ago:
+        # For custom date range, always sort by date to get chronological results
+        params['sort_by'] = 'date_posted'
+    else:
+        if date_posted:
+            params['date_posted'] = date_posted
+        if sort_by:
+            params['sort_by'] = sort_by
+    
+    if content_type:
+        params['content_type'] = content_type
+    
+    logger.info(f"🔍 Search posts: keyword='{keyword}', page={page}, session={search_session_id}")
+    
+    # Make API call
+    response_data = await make_linkedin_api_call(client, SEARCH_POSTS_API, headers, params)
+    
+    if not response_data:
+        logger.error(f"Search posts API call failed for page {page}")
+        
+        # Retry logic
+        if retry_count < max_retries:
+            logger.info(f"Retrying page {page} (attempt {retry_count + 1}/{max_retries})")
+            retry_job = job.copy()
+            retry_job['_retry_count'] = retry_count + 1
+            retry_job['job_id'] = f"{search_session_id}_page_{page}_retry_{retry_count + 1}"
+            
+            if redis_client:
+                await redis_client.rpush(REDIS_QUEUE_KEY, json.dumps(retry_job))
+            
+            return {
+                'success': False,
+                'error': 'API call failed, queued for retry',
+                'search_session_id': search_session_id,
+                'page': page,
+                'retry_count': retry_count + 1
+            }
+        else:
+            # Send error webhook
+            if webhook_url:
+                error_payload = {
+                    'search_session_id': search_session_id,
+                    'keyword': keyword,
+                    'page': page,
+                    'status': 'error',
+                    'error': f'API call failed after {max_retries} retries'
+                }
+                try:
+                    await client.post(webhook_url, json=error_payload, timeout=10.0)
+                except Exception as e:
+                    logger.error(f"Error webhook failed: {e}")
+            
+            return {
+                'success': False,
+                'error': f'API call failed after {max_retries} retries',
+                'search_session_id': search_session_id,
+                'page': page
+            }
+    
+    posts = response_data.get('data', [])
+    has_more = response_data.get('has_more', False)
+    total = response_data.get('total', 0)
+    
+    logger.info(f"✓ Fetched {len(posts)} posts from page {page} (total: {total}, has_more: {has_more})")
+    
+    # Track if we should continue to next page
+    should_continue = has_more
+    posts_sent = 0
+    cutoff_reached = False
+    
+    # Send individual webhooks for each post
+    if webhook_url and posts:
+        cutoff_date = None
+        if custom_days_ago:
+            cutoff_date = datetime.now(timezone.utc) - timedelta(days=int(custom_days_ago))
+        
+        for post in posts:
+            # Check custom date filter
+            if cutoff_date:
+                created_at = post.get('created_at')
+                if created_at:
+                    try:
+                        if created_at.endswith('Z'):
+                            created_at = created_at.replace('Z', '+00:00')
+                        post_date = datetime.fromisoformat(created_at)
+                        if post_date.tzinfo is None:
+                            post_date = post_date.replace(tzinfo=timezone.utc)
+                        
+                        if post_date < cutoff_date:
+                            logger.info(f"Post from {created_at} is older than {custom_days_ago} days, stopping")
+                            should_continue = False
+                            cutoff_reached = True
+                            break
+                    except Exception as e:
+                        logger.warning(f"Error parsing post date {created_at}: {e}")
+            
+            # Build webhook payload for individual post
+            post_payload = {
+                'search_session_id': search_session_id,
+                'keyword': keyword,
+                'page': page,
+                'post': post
+            }
+            
+            try:
+                await client.post(webhook_url, json=post_payload, timeout=10.0)
+                posts_sent += 1
+                logger.debug(f"Webhook sent for post {post.get('id', 'unknown')}")
+            except Exception as e:
+                logger.error(f"Webhook failed for post {post.get('id', 'unknown')}: {e}")
+            
+            # Rate limit between webhook calls
+            await asyncio.sleep(WEBHOOK_DELAY_SECONDS)
+    
+    logger.info(f"✓ Sent {posts_sent} webhooks for page {page}")
+    
+    # Queue next page if needed
+    if should_continue and not cutoff_reached:
+        next_page_job = {
+            'job_type': 'search_posts',
+            'job_id': f"{search_session_id}_page_{page + 1}",
+            'search_session_id': search_session_id,
+            'keyword': keyword,
+            'webhook_url': webhook_url,
+            'page': page + 1,
+            'queued_at': time.time()
+        }
+        
+        # Carry over optional params
+        if date_posted:
+            next_page_job['date_posted'] = date_posted
+        if sort_by and not custom_days_ago:
+            next_page_job['sort_by'] = sort_by
+        if content_type:
+            next_page_job['content_type'] = content_type
+        if custom_days_ago:
+            next_page_job['custom_days_ago'] = custom_days_ago
+        
+        if redis_client:
+            await redis_client.rpush(REDIS_QUEUE_KEY, json.dumps(next_page_job))
+            logger.info(f"📋 Queued next page: {page + 1}")
+    else:
+        # Send completion webhook
+        if webhook_url:
+            completion_payload = {
+                'search_session_id': search_session_id,
+                'keyword': keyword,
+                'status': 'completed',
+                'final_page': page,
+                'reason': 'cutoff_date_reached' if cutoff_reached else 'no_more_results'
+            }
+            try:
+                await client.post(webhook_url, json=completion_payload, timeout=10.0)
+                logger.info(f"✓ Sent completion webhook for session {search_session_id}")
+            except Exception as e:
+                logger.error(f"Completion webhook failed: {e}")
+    
+    return {
+        'success': True,
+        'search_session_id': search_session_id,
+        'keyword': keyword,
+        'page': page,
+        'posts_fetched': len(posts),
+        'posts_sent': posts_sent,
+        'has_more': has_more,
+        'continued': should_continue and not cutoff_reached
+    }
+
+
 # ==================== TRANSFORMATIONS ====================
 
 def transform_linkedin_reactions_text_only(response_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -382,7 +592,7 @@ async def update_job_status(job_id: str, status: str, result=None, error=None):
 
 
 async def process_job(job: Dict[str, Any]):
-    """Process a single job - handles both generic API calls and LinkedIn scraper jobs."""
+    """Process a single job - handles generic API calls, LinkedIn scraper, and search posts jobs."""
     job_id = job['job_id']
     job_type = job.get('job_type', 'generic')
     webhook_url = job.get('callback_webhook_url') or job.get('webhook_url')
@@ -391,6 +601,13 @@ async def process_job(job: Dict[str, Any]):
 
     async with httpx.AsyncClient() as client:
         try:
+            # Search posts job
+            if job_type == 'search_posts':
+                logger.info(f"Processing search posts job {job_id}")
+                results = await process_search_posts_job(job, client)
+                await update_job_status(job_id, "completed", result=results)
+                return
+
             # LinkedIn scraper job
             if job_type == 'linkedin_scraper':
                 logger.info(f"Processing LinkedIn scraper job {job_id}")
@@ -468,6 +685,9 @@ async def process_job(job: Dict[str, Any]):
                 if job_type == 'linkedin_scraper':
                     error_payload['username'] = job.get('username')
                     error_payload['urn'] = job.get('urn')
+                elif job_type == 'search_posts':
+                    error_payload['keyword'] = job.get('keyword')
+                    error_payload['search_session_id'] = job.get('search_session_id')
                 else:
                     error_payload['target_url'] = job.get('target_api_url')
                 
@@ -495,7 +715,7 @@ async def queue_worker():
                     start_time = time.monotonic()
 
                     try:
-                        await asyncio.wait_for(process_job(job), timeout=60.0)
+                        await asyncio.wait_for(process_job(job), timeout=300.0)  # Increased timeout for search jobs
                     except asyncio.TimeoutError:
                         logger.error(f"Job {job.get('job_id')} timed out")
                         await update_job_status(job['job_id'], "timeout")
@@ -521,6 +741,13 @@ async def lifespan(app: FastAPI):
         redis_client = redis.from_url(REDIS_URL, decode_responses=True)
         await redis_client.ping()
         logger.info("Redis connected")
+        
+        # Validate RAPIDAPI_KEY
+        if not RAPIDAPI_KEY:
+            logger.warning("RAPIDAPI_KEY not set - LinkedIn API calls will fail")
+        else:
+            logger.info("RAPIDAPI_KEY configured")
+        
         asyncio.create_task(queue_worker())
     except Exception as e:
         logger.critical(f"Redis connection failed: {e}")
@@ -538,9 +765,10 @@ app = FastAPI(lifespan=lifespan)
 @app.post("/process")
 async def queue_job(request: Request, response: Response):
     """
-    Queue a job. Supports two types:
+    Queue a job. Supports three types:
     1. Generic API proxy: Requires target_api_url
     2. LinkedIn scraper: Requires username or urn + full_name
+    3. Search posts: Requires keyword
     """
     try:
         body = await request.json()
@@ -549,21 +777,61 @@ async def queue_job(request: Request, response: Response):
         return {"error": "Invalid JSON"}
 
     # Detect job type
+    is_search_posts_job = (
+        'keyword' in body and
+        'target_api_url' not in body and
+        'username' not in body and
+        'urn' not in body
+    )
+    
     is_linkedin_job = (
         ('username' in body or 'urn' in body) and
-        'api_key' in body and
         'target_api_url' not in body
     )
 
-    if is_linkedin_job:
+    if is_search_posts_job:
+        # Search posts job
+        if not body.get('keyword'):
+            response.status_code = 400
+            return {"error": "keyword is required for search posts"}
+        
+        if not body.get('webhook_url'):
+            response.status_code = 400
+            return {"error": "webhook_url is required for search posts"}
+        
+        # Validate optional params
+        valid_date_posted = ['past_month', 'past_week', 'past_24h']
+        if body.get('date_posted') and body['date_posted'] not in valid_date_posted:
+            response.status_code = 400
+            return {"error": f"date_posted must be one of: {valid_date_posted}"}
+        
+        valid_sort_by = ['date_posted', 'relevance']
+        if body.get('sort_by') and body['sort_by'] not in valid_sort_by:
+            response.status_code = 400
+            return {"error": f"sort_by must be one of: {valid_sort_by}"}
+        
+        valid_content_type = ['videos', 'photos', 'jobs', 'live_videos', 'documents', 'collaborative_articles']
+        if body.get('content_type') and body['content_type'] not in valid_content_type:
+            response.status_code = 400
+            return {"error": f"content_type must be one of: {valid_content_type}"}
+        
+        if body.get('custom_days_ago'):
+            try:
+                days = int(body['custom_days_ago'])
+                if days <= 0:
+                    raise ValueError()
+            except (ValueError, TypeError):
+                response.status_code = 400
+                return {"error": "custom_days_ago must be a positive integer"}
+
+        body['job_type'] = 'search_posts'
+        body['page'] = 1  # Always start from page 1
+        
+    elif is_linkedin_job:
         # LinkedIn scraper job
         if not body.get('username') and not body.get('urn'):
             response.status_code = 400
             return {"error": "username or urn is required for LinkedIn scraper"}
-        
-        if not body.get('api_key'):
-            response.status_code = 400
-            return {"error": "api_key is required"}
         
         if body.get('urn') and not body.get('full_name'):
             response.status_code = 400
@@ -594,6 +862,10 @@ async def queue_job(request: Request, response: Response):
     job_id = str(uuid.uuid4())
     body['job_id'] = job_id
     body['queued_at'] = time.time()
+    
+    # For search_posts, set search_session_id same as initial job_id
+    if body['job_type'] == 'search_posts':
+        body['search_session_id'] = job_id
 
     queue_position = -1
     if redis_client:
@@ -602,13 +874,19 @@ async def queue_job(request: Request, response: Response):
 
     logger.info(f"Queued {job_id} (type: {body['job_type']}) at position {queue_position}")
 
-    response.status_code = 202
-    return {
+    result = {
         "job_id": job_id,
         "status": "queued",
         "job_type": body['job_type'],
         "queue_position": queue_position
     }
+    
+    # Include search_session_id for search_posts jobs
+    if body['job_type'] == 'search_posts':
+        result['search_session_id'] = body['search_session_id']
+
+    response.status_code = 202
+    return result
 
 
 @app.get("/status/{job_id}")
@@ -637,7 +915,8 @@ async def health():
         "status": "ok" if redis_ok else "degraded",
         "redis_connected": redis_ok,
         "queue_depth": queue_depth,
-        "rate_limit": f"{60/SECONDS_BETWEEN_REQUESTS:.0f}/min"
+        "rate_limit": f"{60/SECONDS_BETWEEN_REQUESTS:.0f}/min",
+        "rapidapi_configured": bool(RAPIDAPI_KEY)
     }
 
 
@@ -646,12 +925,21 @@ async def root():
     return {
         "service": "Rate-Limited API Proxy with LinkedIn Scraper",
         "endpoints": {
-            "POST /process": "Queue a new job (generic API or LinkedIn scraper)",
+            "POST /process": "Queue a new job (generic API, LinkedIn scraper, or search posts)",
             "GET /status/{job_id}": "Check job status",
             "GET /health": "Service health check"
         },
         "job_types": {
             "generic": "Requires target_api_url",
-            "linkedin_scraper": "Requires username or urn + full_name, api_key"
+            "linkedin_scraper": "Requires username or urn + full_name",
+            "search_posts": "Requires keyword + webhook_url"
+        },
+        "search_posts_params": {
+            "keyword": "Search term (required)",
+            "webhook_url": "URL to receive individual posts (required)",
+            "date_posted": "past_month | past_week | past_24h (optional)",
+            "sort_by": "date_posted | relevance (optional)",
+            "content_type": "videos | photos | jobs | live_videos | documents | collaborative_articles (optional)",
+            "custom_days_ago": "Integer - custom date filter in days (optional, overrides date_posted)"
         }
     }
