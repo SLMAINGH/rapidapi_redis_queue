@@ -398,15 +398,13 @@ async def process_search_posts_job(job: Dict[str, Any], client: httpx.AsyncClien
             cutoff_date = datetime.now(timezone.utc) - timedelta(days=int(custom_days_ago))
         
         for post in posts:
-            # Check if keyword actually appears in post content
-            post_title = post.get('title', '') or ''
-            post_text = post.get('text', '') or ''
-            post_content = f"{post_title} {post_text}".lower()
+            # Check if keyword actually appears in post title
+            post_title = (post.get('title', '') or '').lower()
             keyword_lower = keyword.lower()
             
-            if keyword_lower not in post_content:
+            if keyword_lower not in post_title:
                 posts_filtered += 1
-                logger.debug(f"Skipping post {post.get('id', 'unknown')} - keyword '{keyword}' not found in content")
+                logger.debug(f"Skipping post {post.get('id', 'unknown')} - keyword '{keyword}' not found in title")
                 continue
             
             # Check custom date filter
@@ -446,7 +444,7 @@ async def process_search_posts_job(job: Dict[str, Any], client: httpx.AsyncClien
             # Rate limit between webhook calls
             await asyncio.sleep(WEBHOOK_DELAY_SECONDS)
     
-    logger.info(f"✓ Sent {posts_sent} webhooks for page {page} (filtered out {posts_filtered} without keyword)")
+    logger.info(f"✓ Sent {posts_sent} webhooks for page {page} (filtered out {posts_filtered} without keyword in title)")
     
     # Queue next page if needed
     if should_continue and not cutoff_reached:
